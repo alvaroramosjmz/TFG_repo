@@ -244,7 +244,7 @@ def cost_func(agent, alpha, beta,
 #  abc_generate_neighbor: genera la solución vecina v_i según la ecuación ABC.
 #  Debe estar a nivel de módulo para ser serializable por multiprocessing.
 #
-#  Ecuación de actualización (Karaboga & Basturk, 2007):
+#  Ecuación de actualización:
 #      v_ij = x_ij + phi_ij * (x_ij - x_kj),   phi_ij in [-1, 1]
 #
 #  Binarización con función sigmoide:
@@ -297,10 +297,10 @@ def abc_generate_neighbor(x_i, x_k, rng_seed):
 #  boa_move_butterfly: calcula la nueva posición de una mariposa.
 #  Debe estar a nivel de módulo para ser serializable por multiprocessing.
 #
-#  Ecuación búsqueda global (Arora & Singh, 2019, Eq. 2):
+#  Ecuación búsqueda global:
 #      x_i^{t+1} = x_i^t + (r^2 * g* - x_i^t) * f_i
 #
-#  Ecuación búsqueda local (Arora & Singh, 2019, Eq. 3):
+#  Ecuación búsqueda local:
 #      x_i^{t+1} = x_i^t + (r^2 * x_j^t - x_k^t) * f_i
 #
 #  Binarización con sigmoide: S(v) = 1/(1+e^{-v})
@@ -347,6 +347,337 @@ def boa_move_butterfly(x_i, g_star, x_j, x_k, fragrance_i, p_switch, rng_seed):
         x_new[d] = 1 if rng.random() < s_v else 0
 
     return x_new
+
+# ==============================================================================
+#
+#  MFO — Función auxiliar a nivel de módulo
+#
+#  mfo_move_moth: calcula la nueva posición de una polilla en espiral
+#  alrededor de su llama asignada.
+#  Debe estar a nivel de módulo para ser serializable por multiprocessing.
+#
+#  Ecuación de movimiento espiral:
+#      D_i  = |F_j - M_i|
+#      M_i^{l+1} = D_i * e^{bt} * cos(2*pi*t) + F_j
+#
+#  Binarización con sigmoide: S(v) = 1/(1+e^{-v})
+#
+# ==============================================================================
+
+def mfo_move_moth(m_i, f_j, b, t, rng_seed):
+    """
+    Calcula la nueva posición de la polilla m_i orbitando su llama f_j.
+    Ejecutada en los procesos hijos de Pool.starmap().
+
+    Parámetros:
+    m_i      -- posición actual de la polilla i  [MAX_FEATURES]  binario
+    f_j      -- posición de la llama j asignada  [MAX_FEATURES]  binario
+    b        -- constante de la espiral logarítmica (b=1)
+    t        -- número aleatorio en [r, 1], r ∈ [-1,-2]
+    rng_seed -- semilla para el RNG del proceso hijo
+
+    Retorna:
+    m_new -- nueva posición binarizada de la polilla  [MAX_FEATURES]  binario
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(rng_seed)
+
+    # Distancia entre polilla y llama (componente a componente)
+    # D_i = |F_j - M_i|
+    d_i = np.abs(f_j.astype(float) - m_i.astype(float))
+
+    # Ecuación de movimiento espiral logarítmica
+    # M_i^{l+1} = D_i * e^{bt} * cos(2*pi*t) + F_j
+    m_cont = d_i * math.exp(b * t) * math.cos(2 * math.pi * t) + f_j.astype(float)
+
+    # Binarizar con función sigmoide: S(v) = 1/(1+e^{-v})
+    m_new = np.zeros(len(m_i), dtype=int)
+    for d in range(len(m_i)):
+        s_v      = 1.0 / (1.0 + math.exp(-float(m_cont[d])))
+        m_new[d] = 1 if rng.random() < s_v else 0
+
+    return m_new
+
+# ==============================================================================
+#
+#  HHO — Función auxiliar a nivel de módulo
+#
+#  hho_update_hawk: calcula la nueva posición de un halcón según el HHO.
+#  Implementa las 6 fases del algoritmo.
+#  Debe estar a nivel de módulo para ser serializable por multiprocessing.
+#
+# ==============================================================================
+
+def hho_update_hawk(x_i, cost_i, x_rabbit, x_m, x_rand,
+                    E, alpha, beta,
+                    num_samples_train, num_samples_test,
+                    train_x, train_y, test_x, test_y,
+                    num_char, max_features, rng_seed):
+    """
+    Calcula la nueva posición del halcón x_i según la fase del HHO.
+    Ejecutada en los procesos hijos de Pool.starmap().
+
+    En las Fases 5 y 6 se evalúan los candidatos Y y Z llamando
+    directamente a cost_func desde el proceso hijo.
+
+    Parámetros:
+    x_i, cost_i  -- posición y coste actual del halcón i
+    x_rabbit     -- mejor solución global (la presa)
+    x_m          -- posición media de todos los halcones
+    x_rand       -- halcón aleatorio de la población (para Fase 1)
+    E            -- energía de escape de la presa (escalar)
+    alpha, beta  -- pesos de cost_func
+    ... datos del dataset ...
+    rng_seed     -- semilla para el RNG del proceso hijo
+
+    Retorna:
+    (x_new, cost_new) -- nueva posición binarizada y su coste
+    """
+    import numpy as np
+    from scipy.special import gamma
+
+    rng = np.random.default_rng(rng_seed)
+    D   = len(x_i)
+
+    # Función sigmoide vectorizada para binarizar
+    def binarize(v_cont):
+        s   = 1.0 / (1.0 + np.exp(-v_cont.astype(float)))
+        return (rng.random(D) < s).astype(int)
+
+    # Función de vuelo de Lévy (Heidari et al., 2019, Ec. levy)
+    def levy(d):
+        beta_levy = 1.5
+        sigma = (gamma(1 + beta_levy) * np.sin(np.pi * beta_levy / 2) /
+                 (gamma((1 + beta_levy) / 2) * beta_levy *
+                  2 ** ((beta_levy - 1) / 2))) ** (1 / beta_levy)
+        u = rng.random(d) * sigma
+        v = rng.random(d)
+        lf = 0.01 * u / (np.abs(v) ** (1 / beta_levy))
+        return lf
+
+    abs_E = abs(E)
+
+    if abs_E >= 1:
+        # ------------------------------------------------------------------
+        #  FASE 1 — EXPLORACIÓN
+        #  El halcón busca al conejo posicionándose en perchas elevadas
+        # ------------------------------------------------------------------
+        q  = rng.random()
+        r1 = rng.random(); r2 = rng.random()
+        r3 = rng.random(); r4 = rng.random()
+
+        if q >= 0.5:
+            # Sub-estrategia 1: posicionarse cerca de otro halcón aleatorio
+            v_cont = (x_rand.astype(float)
+                      - r1 * np.abs(x_rand.astype(float)
+                                    - 2 * r2 * x_i.astype(float)))
+        else:
+            # Sub-estrategia 2: posición aleatoria en el territorio
+            # LB=0, UB=1 → r3*(LB + r4*(UB-LB)) = r3*r4
+            v_cont = (x_rabbit.astype(float) - x_m.astype(float)
+                      - r3 * r4 * np.ones(D))
+
+        x_new  = binarize(v_cont)
+        c_new  = cost_func(x_new, alpha, beta,
+                           num_samples_train, num_samples_test,
+                           train_x, train_y, test_x, test_y,
+                           num_char, max_features)
+
+    else:
+        # ------------------------------------------------------------------
+        #  FASES 3-6 — EXPLOTACIÓN
+        # ------------------------------------------------------------------
+        r  = rng.random()
+        r5 = rng.random()
+        J  = 2 * (1 - r5)   # fuerza de salto del conejo
+
+        delta_x = x_rabbit.astype(float) - x_i.astype(float)
+
+        if r >= 0.5 and abs_E >= 0.5:
+            # --------------------------------------------------------------
+            #  FASE 3 — CERCO SUAVE
+            #  X_i = ΔX - E*|J*X_rabbit - X_i|
+            # --------------------------------------------------------------
+            v_cont = (delta_x
+                      - E * np.abs(J * x_rabbit.astype(float)
+                                   - x_i.astype(float)))
+            x_new = binarize(v_cont)
+            c_new = cost_func(x_new, alpha, beta,
+                              num_samples_train, num_samples_test,
+                              train_x, train_y, test_x, test_y,
+                              num_char, max_features)
+
+        elif r >= 0.5 and abs_E < 0.5:
+            # --------------------------------------------------------------
+            #  FASE 4 — CERCO DURO
+            #  X_i = X_rabbit - E*|ΔX|
+            # --------------------------------------------------------------
+            v_cont = (x_rabbit.astype(float)
+                      - E * np.abs(delta_x))
+            x_new = binarize(v_cont)
+            c_new = cost_func(x_new, alpha, beta,
+                              num_samples_train, num_samples_test,
+                              train_x, train_y, test_x, test_y,
+                              num_char, max_features)
+
+        elif r < 0.5 and abs_E >= 0.5:
+            # --------------------------------------------------------------
+            #  FASE 5 — CERCO SUAVE CON BUCEOS RÁPIDOS (Lévy)
+            #  Y = X_rabbit - E*|J*X_rabbit - X_i|
+            #  Z = Y + S × LF(D)
+            #  X_i = argmin(f(X_i), f(Y), f(Z))
+            # --------------------------------------------------------------
+            y_cont = (x_rabbit.astype(float)
+                      - E * np.abs(J * x_rabbit.astype(float)
+                                   - x_i.astype(float)))
+            Y      = binarize(y_cont)
+            c_Y    = cost_func(Y, alpha, beta,
+                               num_samples_train, num_samples_test,
+                               train_x, train_y, test_x, test_y,
+                               num_char, max_features)
+
+            S      = rng.random(D)
+            z_cont = y_cont + S * levy(D)
+            Z      = binarize(z_cont)
+            c_Z    = cost_func(Z, alpha, beta,
+                               num_samples_train, num_samples_test,
+                               train_x, train_y, test_x, test_y,
+                               num_char, max_features)
+
+            # Selección progresiva: elegir la mejor de las tres
+            if c_Y < cost_i:
+                x_new, c_new = Y, c_Y
+            elif c_Z < cost_i:
+                x_new, c_new = Z, c_Z
+            else:
+                x_new, c_new = x_i.copy(), cost_i
+
+        else:
+            # --------------------------------------------------------------
+            #  FASE 6 — CERCO DURO CON BUCEOS RÁPIDOS (Lévy)
+            #  Y = X_rabbit - E*|J*X_rabbit - X_m|
+            #  Z = Y + S × LF(D)
+            #  X_i = argmin(f(X_i), f(Y), f(Z))
+            # --------------------------------------------------------------
+            y_cont = (x_rabbit.astype(float)
+                      - E * np.abs(J * x_rabbit.astype(float)
+                                   - x_m.astype(float)))
+            Y      = binarize(y_cont)
+            c_Y    = cost_func(Y, alpha, beta,
+                               num_samples_train, num_samples_test,
+                               train_x, train_y, test_x, test_y,
+                               num_char, max_features)
+
+            S      = rng.random(D)
+            z_cont = y_cont + S * levy(D)
+            Z      = binarize(z_cont)
+            c_Z    = cost_func(Z, alpha, beta,
+                               num_samples_train, num_samples_test,
+                               train_x, train_y, test_x, test_y,
+                               num_char, max_features)
+
+            if c_Y < cost_i:
+                x_new, c_new = Y, c_Y
+            elif c_Z < cost_i:
+                x_new, c_new = Z, c_Z
+            else:
+                x_new, c_new = x_i.copy(), cost_i
+
+    return x_new, c_new
+
+
+# ==============================================================================
+#
+#  ARO — Función auxiliar a nivel de módulo
+#
+#  aro_move_rabbit: genera la posición candidata v_i del conejo i.
+#  Debe estar a nivel de módulo para ser serializable por multiprocessing.
+#
+#  Fase 2 — Forrajeo en desvío:
+#      v_i = x_j + R*(x_i - x_j) + round(0.5*(0.05+r1))*n1
+#      R = L * c,  L = (e - e^{((t-1)/I)²})*sin(2π*r2)
+#
+#  Fase 3 — Escondite aleatorio:
+#      b_ir = x_i + H * g_r * x_i
+#      v_i  = x_i + R*(r4*b_ir - x_i)
+#      H = ((I-t+1)/I)*r4
+#
+# ==============================================================================
+
+def aro_move_rabbit(x_i, x_j, A_t, t, num_it, rng_seed):
+    """
+    Genera la posición candidata v_i del conejo i según el ARO.
+    Ejecutada en los procesos hijos de Pool.starmap().
+
+    Parámetros:
+    x_i      -- posición actual del conejo i  [D]  binario
+    x_j      -- conejo aleatorio j≠i          [D]  binario  (para Fase 2)
+    A_t      -- factor de energía de la iteración (escalar, compartido)
+    t        -- iteración actual (1-indexed)
+    num_it   -- número total de iteraciones I
+    rng_seed -- semilla para el RNG del proceso hijo
+
+    Retorna:
+    v_bin -- posición candidata binarizada  [D]  binario
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(rng_seed)
+    D   = len(x_i)
+
+    # Vector de mapeo c: activa aleatoriamente dimensiones (prob 0.5 por dim)
+    c = rng.integers(0, 2, size=D)
+
+    # Operador de carrera L (decreciente con las iteraciones)
+    r2 = rng.random()
+    L  = (math.e - math.exp(((t - 1) / num_it) ** 2)) * math.sin(2 * math.pi * r2)
+
+    # Operador R = L * c  (vector)
+    R = L * c
+
+    if A_t > 1:
+        # ----------------------------------------------------------------------
+        #  FASE 2 — FORRAJEO EN DESVÍO (exploración)
+        #  v_i = x_j + R*(x_i - x_j) + round(0.5*(0.05+r1))*n1
+        # ----------------------------------------------------------------------
+        r1 = rng.random()
+        n1 = rng.standard_normal(D)          # ruido gaussiano
+
+        v_cont = (x_j.astype(float)
+                  + R * (x_i.astype(float) - x_j.astype(float))
+                  + round(0.5 * (0.05 + r1)) * n1)
+
+    else:
+        # ----------------------------------------------------------------------
+        #  FASE 3 — ESCONDITE ALEATORIO (explotación)
+        #  b_ir = x_i + H * g_r * x_i
+        #  v_i  = x_i + R*(r4*b_ir - x_i)
+        # ----------------------------------------------------------------------
+        r4 = rng.random()
+        r5 = rng.random()
+
+        # H: parámetro de escondite decreciente
+        H = ((num_it - t + 1) / num_it) * r4
+
+        # g_r: vector con 1 solo en la dimensión k aleatoria
+        k   = int(math.ceil(r5 * D)) - 1    # índice 0-based
+        k   = max(0, min(k, D - 1))         # clamp por seguridad
+        g_r = np.zeros(D)
+        g_r[k] = 1.0
+
+        # Madriguera aleatoria alrededor de x_i
+        b_ir = x_i.astype(float) + H * g_r * x_i.astype(float)
+
+        v_cont = (x_i.astype(float)
+                  + R * (r4 * b_ir - x_i.astype(float)))
+
+    # Binarizar con función sigmoide: S(v) = 1/(1+e^{-v})
+    s_v   = 1.0 / (1.0 + np.exp(-v_cont))
+    v_bin = (rng.random(D) < s_v).astype(int)
+
+    return v_bin
+
 
 # ==============================================================================
 #  PUNTO DE ENTRADA PRINCIPAL
@@ -588,7 +919,6 @@ if __name__ == "__main__":
     # ==========================================================================
     #
     #  ABC — Artificial Bee Colony
-    #  Referencia: Karaboga & Basturk (2007), J. Global Optimization 39:459-471
     #
     # ==========================================================================
  
@@ -769,7 +1099,6 @@ if __name__ == "__main__":
     # ==========================================================================
     #
     #  BOA — Butterfly Optimization Algorithm
-    #  Referencia: Arora & Singh (2019), Soft Computing 23:715-734
     #
     # ==========================================================================
 
@@ -904,15 +1233,397 @@ if __name__ == "__main__":
                     print(f"Iteración {t+1} | Mejor coste = {best_cost:.6f}")
 
             return g_star, curve
-    # --------------------------------------------------------------------------
-    #  BLOQUE DE EJECUCIÓN DEL ALGORITMO
+        
+    # ==========================================================================
     #
-    #  Aquí se irán añadiendo los algoritmos poco a poco.
-    #  Cada algoritmo debe producir al final:
-    #    - solution             : vector binario [MAX_FEATURES]
-    #    - best_solutions_fitness : vector [num_it] con el mejor cost por iteración
-    # --------------------------------------------------------------------------
+    #  MFO — Moth-Flame Optimization
+    #
+    # ==========================================================================
 
+    elif alg_name == "MFO":
+
+        def mfo():
+            """
+            MFO para Feature Selection binaria.
+
+            Dos estructuras separadas:
+              M -- polillas: agentes activos que se mueven en espiral
+              F -- llamas:   mejores posiciones históricas (nunca empeoran)
+
+            Mecanismos clave:
+              - flame_no decrece de N a 1 (exploración → explotación)
+              - r decrece de -1 a -2 (t más cercano a -1 → más explotación)
+              - Llamas se actualizan combinando M y F y ordenando
+
+            Hiperparámetros (Mirjalili, 2015):
+              b = 1  (constante de la espiral logarítmica)
+
+            Retorna: (F_1 [MAX_FEATURES], curve [num_it])
+            """
+
+            # ------------------------------------------------------------------
+            #  HIPERPARÁMETROS
+            # ------------------------------------------------------------------
+
+            B = 1   # constante de la espiral logarítmica
+
+            # ------------------------------------------------------------------
+            #  FASE 0 — INICIALIZACIÓN
+            # ------------------------------------------------------------------
+
+            # Inicializar N polillas
+            M      = [construct_agent(DESIRED_N_FEATURES) for _ in range(num_ind)]
+            OM     = np.full(num_ind, np.inf)   # costes de las polillas
+            curve  = np.zeros(num_it)
+
+            # Evaluación inicial en paralelo
+            args = [[M[i], ALPHA, BETA,
+                     NUM_SAMPLES_TRAIN, NUM_SAMPLES_TEST,
+                     TRAIN_X, TRAIN_Y, TEST_X, TEST_Y,
+                     NUM_CHAR, MAX_FEATURES] for i in range(num_ind)]
+
+            with Pool(processes=num_proc) as pool:
+                result = pool.starmap(cost_func, args,
+                                      chunksize=num_ind // num_proc + int(num_ind % num_proc != 0))
+            for i in range(num_ind):
+                OM[i] = result[i]
+
+            # Ordenar polillas por fitness ascendente
+            sorted_idx = np.argsort(OM)
+            M  = [M[i] for i in sorted_idx]
+            OM = OM[sorted_idx]
+
+            # Llamas iniciales = polillas ordenadas
+            F  = [M[i].copy() for i in range(num_ind)]
+            OF = OM.copy()
+
+            # Mejor solución: primera llama (la de menor coste)
+            best_solution = F[0].copy()
+            best_cost     = OF[0]
+
+            if not measure_mode:
+                print(f"Iteración 0 | Mejor coste = {best_cost:.6f}")
+
+            # ------------------------------------------------------------------
+            #  BUCLE PRINCIPAL
+            # ------------------------------------------------------------------
+
+            for l in range(1, num_it + 1):
+
+                # Número adaptativo de llamas activas (decrece de N a 1)
+                flame_no = round(num_ind - l * (num_ind - 1) / num_it)
+                flame_no = max(1, flame_no)   # mínimo 1 llama siempre
+
+                # Constante de convergencia r ∈ [-1, -2]
+                r = -1 - l / num_it
+
+                # --------------------------------------------------------------
+                #  MOVIMIENTO EN ESPIRAL (#parallel N, λ)
+                # --------------------------------------------------------------
+
+                args_move = []
+                for i in range(num_ind):
+                    # Asignación de llama: polilla i → llama i si i < flame_no,
+                    # si no → última llama activa
+                    j = i if i < flame_no else flame_no - 1
+
+                    # t ~ U(r, 1): posición sobre la espiral
+                    t = rand.uniform(r, 1)
+
+                    seed = np.random.randint(0, 2**31)
+                    args_move.append([M[i], F[j], B, t, seed])
+
+                with Pool(processes=num_proc) as pool:
+                    M_new = pool.starmap(
+                        mfo_move_moth, args_move,
+                        chunksize=num_ind // num_proc + int(num_ind % num_proc != 0)
+                    )
+
+                # Corregir features sobrantes
+                for i in range(num_ind):
+                    M_new[i] = delete_features(M_new[i])
+
+                # --------------------------------------------------------------
+                #  EVALUACIÓN EN PARALELO
+                # --------------------------------------------------------------
+
+                args_cost = [[M_new[i], ALPHA, BETA,
+                              NUM_SAMPLES_TRAIN, NUM_SAMPLES_TEST,
+                              TRAIN_X, TRAIN_Y, TEST_X, TEST_Y,
+                              NUM_CHAR, MAX_FEATURES] for i in range(num_ind)]
+
+                with Pool(processes=num_proc) as pool:
+                    OM_new = pool.starmap(
+                        cost_func, args_cost,
+                        chunksize=num_ind // num_proc + int(num_ind % num_proc != 0)
+                    )
+
+                OM_new = np.array(OM_new)
+
+                # Actualizar posiciones de polillas
+                for i in range(num_ind):
+                    M[i]  = M_new[i]
+                    OM[i] = OM_new[i]
+
+                # --------------------------------------------------------------
+                #  ACTUALIZACIÓN DE LLAMAS
+                #  Combinar polillas nuevas con llamas anteriores,
+                #  ordenar y quedarse con las N mejores
+                # --------------------------------------------------------------
+
+                # Combinar las 2N soluciones (polillas + llamas anteriores)
+                combined_agents = M + F
+                combined_costs  = np.concatenate([OM_new, OF])
+
+                # Ordenar por coste ascendente y tomar las N mejores
+                sorted_idx = np.argsort(combined_costs)
+                F  = [combined_agents[idx].copy() for idx in sorted_idx[:num_ind]]
+                OF = combined_costs[sorted_idx[:num_ind]]
+
+                # --------------------------------------------------------------
+                #  ACTUALIZAR MEJOR SOLUCIÓN GLOBAL
+                #  La mejor llama F[0] es siempre la mejor solución global
+                # --------------------------------------------------------------
+
+                if OF[0] < best_cost:
+                    best_solution = F[0].copy()
+                    best_cost     = OF[0]
+
+                curve[l - 1] = best_cost
+
+                if not measure_mode:
+                    print(f"Iteración {l} | Mejor coste = {best_cost:.6f}")
+
+            return best_solution, curve
+        
+    # ==========================================================================
+    #
+    #  HHO — Harris Hawks Optimization
+    #
+    # ==========================================================================
+
+    elif alg_name == "HHO":
+
+        def hho():
+            """
+            HHO para Feature Selection binaria.
+
+            La presa X_rabbit es la mejor solución global.
+            Cada halcón elige dinámicamente entre 6 fases según |E| y r:
+              |E|>=1           → Fase 1: Exploración
+              |E|<1, r>=0.5, |E|>=0.5 → Fase 3: Cerco suave
+              |E|<1, r>=0.5, |E|<0.5  → Fase 4: Cerco duro
+              |E|<1, r<0.5,  |E|>=0.5 → Fase 5: Cerco suave + Lévy
+              |E|<1, r<0.5,  |E|<0.5  → Fase 6: Cerco duro + Lévy
+
+            Hiperparámetros (Heidari et al., 2019):
+              β = 1.5  (exponente del vuelo de Lévy, fijo en la función)
+
+            Retorna: (X_rabbit [MAX_FEATURES], curve [num_it])
+            """
+
+            # ------------------------------------------------------------------
+            #  FASE 0 — INICIALIZACIÓN
+            # ------------------------------------------------------------------
+
+            X      = [construct_agent(DESIRED_N_FEATURES) for _ in range(num_ind)]
+            costs  = np.full(num_ind, np.inf)
+            curve  = np.zeros(num_it)
+
+            # Evaluación inicial en paralelo
+            args = [[X[i], ALPHA, BETA,
+                     NUM_SAMPLES_TRAIN, NUM_SAMPLES_TEST,
+                     TRAIN_X, TRAIN_Y, TEST_X, TEST_Y,
+                     NUM_CHAR, MAX_FEATURES] for i in range(num_ind)]
+
+            with Pool(processes=num_proc) as pool:
+                result = pool.starmap(cost_func, args,
+                                      chunksize=num_ind // num_proc + int(num_ind % num_proc != 0))
+            for i in range(num_ind):
+                costs[i] = result[i]
+
+            # Designar la presa como el mejor halcón
+            best_idx  = int(np.argmin(costs))
+            x_rabbit  = X[best_idx].copy()
+            best_cost = costs[best_idx]
+
+            if not measure_mode:
+                print(f"Iteración 0 | Mejor coste = {best_cost:.6f}")
+
+            # ------------------------------------------------------------------
+            #  BUCLE PRINCIPAL
+            # ------------------------------------------------------------------
+
+            for t in range(1, num_it + 1):
+
+                # Posición media del grupo (necesaria para Fases 1 y 6)
+                X_matrix = np.array([X[i].astype(float) for i in range(num_ind)])
+                x_m      = np.mean(X_matrix, axis=0)
+
+                # Construir argumentos para cada halcón
+                args_hawk = []
+                for i in range(num_ind):
+                    # E0 ~ U(-1,1), E = 2*E0*(1 - t/I)
+                    E0 = rand.uniform(-1, 1)
+                    E  = 2 * E0 * (1 - t / num_it)
+
+                    # Halcón aleatorio distinto de i (para Fase 1)
+                    candidates = list(range(num_ind))
+                    candidates.remove(i)
+                    x_rand = X[rand.choice(candidates)]
+
+                    seed = np.random.randint(0, 2**31)
+                    args_hawk.append([X[i], costs[i], x_rabbit, x_m, x_rand,
+                                      E, ALPHA, BETA,
+                                      NUM_SAMPLES_TRAIN, NUM_SAMPLES_TEST,
+                                      TRAIN_X, TRAIN_Y, TEST_X, TEST_Y,
+                                      NUM_CHAR, MAX_FEATURES, seed])
+
+                # Actualizar halcones en paralelo
+                # Nota: las Fases 5 y 6 llaman a cost_func internamente,
+                # por lo que cada proceso puede hacer hasta 3 evaluaciones
+                with Pool(processes=num_proc) as pool:
+                    results_hawk = pool.starmap(
+                        hho_update_hawk, args_hawk,
+                        chunksize=num_ind // num_proc + int(num_ind % num_proc != 0)
+                    )
+
+                # Actualizar posiciones y costes
+                for i in range(num_ind):
+                    x_new, c_new = results_hawk[i]
+                    x_new        = delete_features(x_new)
+                    X[i]         = x_new
+                    costs[i]     = c_new
+
+                # Actualizar la presa X_rabbit
+                current_best_idx = int(np.argmin(costs))
+                if costs[current_best_idx] < best_cost:
+                    x_rabbit  = X[current_best_idx].copy()
+                    best_cost = costs[current_best_idx]
+
+                curve[t - 1] = best_cost
+
+                if not measure_mode:
+                    print(f"Iteración {t} | Mejor coste = {best_cost:.6f}")
+
+            return x_rabbit, curve
+
+
+    # ==========================================================================
+    #
+    #  ARO — Artificial Rabbits Optimization
+    #
+    # ==========================================================================
+
+    elif alg_name == "ARO":
+
+        def aro():
+            """
+            ARO para Feature Selection binaria.
+
+            Dos estrategias controladas por el factor de energía A(t):
+              A(t) > 1 → Fase 2: Forrajeo en desvío (exploración)
+              A(t) ≤ 1 → Fase 3: Escondite aleatorio (explotación)
+
+            A(t) se calcula una sola vez por iteración y se aplica
+            homogéneamente a todos los conejos.
+            Selección greedy: cada conejo actualiza su posición solo si mejora.
+
+            Sin hiperparámetros adicionales: A(t) controla la transición
+            de forma automática.
+
+            Retorna: (x_best [MAX_FEATURES], curve [num_it])
+            """
+
+            # ------------------------------------------------------------------
+            #  FASE 0 — INICIALIZACIÓN
+            # ------------------------------------------------------------------
+
+            X      = [construct_agent(DESIRED_N_FEATURES) for _ in range(num_ind)]
+            costs  = np.full(num_ind, np.inf)
+            curve  = np.zeros(num_it)
+
+            # Evaluación inicial en paralelo
+            args = [[X[i], ALPHA, BETA,
+                     NUM_SAMPLES_TRAIN, NUM_SAMPLES_TEST,
+                     TRAIN_X, TRAIN_Y, TEST_X, TEST_Y,
+                     NUM_CHAR, MAX_FEATURES] for i in range(num_ind)]
+
+            with Pool(processes=num_proc) as pool:
+                result = pool.starmap(cost_func, args,
+                                      chunksize=num_ind // num_proc + int(num_ind % num_proc != 0))
+            for i in range(num_ind):
+                costs[i] = result[i]
+
+            best_idx      = int(np.argmin(costs))
+            best_solution = X[best_idx].copy()
+            best_cost     = costs[best_idx]
+
+            if not measure_mode:
+                print(f"Iteración 0 | Mejor coste = {best_cost:.6f}")
+
+            # ------------------------------------------------------------------
+            #  BUCLE PRINCIPAL
+            # ------------------------------------------------------------------
+
+            for t in range(1, num_it + 1):
+
+                # Factor de energía: único por iteración
+                # A(t) = 4*(1 - t/I)*ln(1/r), r ~ U(0,1)
+                r_energy = rand.random()
+                A_t      = 4 * (1 - t / num_it) * math.log(1.0 / r_energy)
+
+                # Generar candidatas en paralelo
+                args_move = []
+                for i in range(num_ind):
+                    # Conejo aleatorio j ≠ i (para Fase 2)
+                    candidates = list(range(num_ind))
+                    candidates.remove(i)
+                    j    = rand.choice(candidates)
+                    seed = np.random.randint(0, 2**31)
+                    args_move.append([X[i], X[j], A_t, t, num_it, seed])
+
+                with Pool(processes=num_proc) as pool:
+                    V = pool.starmap(
+                        aro_move_rabbit, args_move,
+                        chunksize=num_ind // num_proc + int(num_ind % num_proc != 0)
+                    )
+
+                # Corregir features sobrantes
+                for i in range(num_ind):
+                    V[i] = delete_features(V[i])
+
+                # Evaluar candidatas en paralelo
+                args_cost = [[V[i], ALPHA, BETA,
+                              NUM_SAMPLES_TRAIN, NUM_SAMPLES_TEST,
+                              TRAIN_X, TRAIN_Y, TEST_X, TEST_Y,
+                              NUM_CHAR, MAX_FEATURES] for i in range(num_ind)]
+
+                with Pool(processes=num_proc) as pool:
+                    costs_v = pool.starmap(
+                        cost_func, args_cost,
+                        chunksize=num_ind // num_proc + int(num_ind % num_proc != 0)
+                    )
+
+                # Selección greedy: actualizar solo si mejora
+                for i in range(num_ind):
+                    if costs_v[i] < costs[i]:
+                        X[i]     = V[i]
+                        costs[i] = costs_v[i]
+
+                # Actualizar mejor global
+                current_best_idx = int(np.argmin(costs))
+                if costs[current_best_idx] < best_cost:
+                    best_solution = X[current_best_idx].copy()
+                    best_cost     = costs[current_best_idx]
+
+                curve[t - 1] = best_cost
+
+                if not measure_mode:
+                    print(f"Iteración {t} | Mejor coste = {best_cost:.6f}")
+
+            return best_solution, curve
+        
     # --------------------------------------------------------------------------
     #  EJECUCIÓN
     # --------------------------------------------------------------------------
@@ -930,6 +1641,15 @@ if __name__ == "__main__":
         
         elif alg_name == "BOA":
             solution, best_solutions_fitness = boa()
+        
+        elif alg_name == "MFO":
+            solution, best_solutions_fitness = mfo()
+        
+        elif alg_name == "HHO":
+            solution, best_solutions_fitness = hho()
+            
+        elif alg_name == "ARO":
+            solution, best_solutions_fitness = aro()
 
     finally:
 
