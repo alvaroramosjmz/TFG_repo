@@ -291,6 +291,64 @@ def abc_generate_neighbor(x_i, x_k, rng_seed):
 
 
 # ==============================================================================
+#
+#  BOA — Función auxiliar a nivel de módulo
+#
+#  boa_move_butterfly: calcula la nueva posición de una mariposa.
+#  Debe estar a nivel de módulo para ser serializable por multiprocessing.
+#
+#  Ecuación búsqueda global (Arora & Singh, 2019, Eq. 2):
+#      x_i^{t+1} = x_i^t + (r^2 * g* - x_i^t) * f_i
+#
+#  Ecuación búsqueda local (Arora & Singh, 2019, Eq. 3):
+#      x_i^{t+1} = x_i^t + (r^2 * x_j^t - x_k^t) * f_i
+#
+#  Binarización con sigmoide: S(v) = 1/(1+e^{-v})
+#
+# ==============================================================================
+
+def boa_move_butterfly(x_i, g_star, x_j, x_k, fragrance_i, p_switch, rng_seed):
+    """
+    Calcula la nueva posición de la mariposa i según el BOA.
+    Ejecutada en los procesos hijos de Pool.starmap().
+
+    Parámetros:
+    x_i          -- posición actual mariposa i  [MAX_FEATURES]  binario
+    g_star       -- mejor solución global       [MAX_FEATURES]  binario
+    x_j, x_k     -- dos mariposas aleatorias j≠k≠i (para búsqueda local)
+    fragrance_i  -- fragancia actual de la mariposa i  (escalar)
+    p_switch     -- probabilidad de búsqueda global (0.8)
+    rng_seed     -- semilla para el RNG del proceso hijo
+
+    Retorna:
+    x_new -- nueva posición binarizada  [MAX_FEATURES]  binario
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(rng_seed)
+    r   = rng.random()
+
+    # Calcular nueva posición continua
+    x_cont = x_i.astype(float)
+
+    if r < p_switch:
+        # Búsqueda global: moverse hacia g*
+        # x_i^{t+1} = x_i^t + (r^2 * g* - x_i^t) * f_i
+        x_cont = x_i + (r**2 * g_star - x_i) * fragrance_i
+    else:
+        # Búsqueda local: paseo aleatorio con x_j y x_k
+        # x_i^{t+1} = x_i^t + (r^2 * x_j - x_k) * f_i
+        x_cont = x_i + (r**2 * x_j - x_k) * fragrance_i
+
+    # Binarizar dimensión a dimensión con función sigmoide
+    x_new = np.zeros(len(x_i), dtype=int)
+    for d in range(len(x_i)):
+        s_v      = 1.0 / (1.0 + math.exp(-float(x_cont[d])))
+        x_new[d] = 1 if rng.random() < s_v else 0
+
+    return x_new
+
+# ==============================================================================
 #  PUNTO DE ENTRADA PRINCIPAL
 # ==============================================================================
 
@@ -706,6 +764,146 @@ if __name__ == "__main__":
                     print(f"Iteración {t+1} | Mejor coste = {best_cost:.6f}")
  
             return best_solution, curve
+        
+    
+    # ==========================================================================
+    #
+    #  BOA — Butterfly Optimization Algorithm
+    #  Referencia: Arora & Singh (2019), Soft Computing 23:715-734
+    #
+    # ==========================================================================
+
+    elif alg_name == "BOA":
+
+        def boa():
+            """
+            BOA para Feature Selection binaria.
+
+            Cada mariposa emite una fragancia proporcional a su fitness.
+            En cada iteración se mueve hacia g* (global) o hace un paseo
+            aleatorio con dos mariposas vecinas (local), con probabilidad p.
+
+            Hiperparámetros (Arora & Singh, 2019):
+              c     = 0.01   modalidad sensorial
+              a_ini = 0.1    exponente inicial (exploración)
+              a_fin = 0.3    exponente final   (explotación)
+              p     = 0.8    probabilidad de búsqueda global
+
+            Retorna: (g_star [MAX_FEATURES], curve [num_it])
+            """
+
+            # ------------------------------------------------------------------
+            #  HIPERPARÁMETROS
+            # ------------------------------------------------------------------
+
+            C     = 0.01   # modalidad sensorial
+            A_INI = 0.1    # exponente de potencia inicial
+            A_FIN = 0.3    # exponente de potencia final
+            P     = 0.8    # probabilidad de búsqueda global
+
+            # ------------------------------------------------------------------
+            #  FASE 0 — INICIALIZACIÓN
+            # ------------------------------------------------------------------
+
+            X      = [construct_agent(DESIRED_N_FEATURES) for _ in range(num_ind)]
+            costs  = np.full(num_ind, np.inf)
+            curve  = np.zeros(num_it)
+
+            # Evaluación inicial en paralelo
+            args = [[X[i], ALPHA, BETA,
+                     NUM_SAMPLES_TRAIN, NUM_SAMPLES_TEST,
+                     TRAIN_X, TRAIN_Y, TEST_X, TEST_Y,
+                     NUM_CHAR, MAX_FEATURES] for i in range(num_ind)]
+
+            with Pool(processes=num_proc) as pool:
+                result = pool.starmap(cost_func, args,
+                                      chunksize=num_ind // num_proc + int(num_ind % num_proc != 0))
+            for i in range(num_ind):
+                costs[i] = result[i]
+
+            # Calcular fragancia inicial: I_i = 1/(1+f_i), frag_i = C * I_i^A_INI
+            intensity  = 1.0 / (1.0 + costs)
+            fragrances = C * (intensity ** A_INI)
+
+            # Mejor solución inicial g*
+            best_idx = int(np.argmin(costs))
+            g_star   = X[best_idx].copy()
+            best_cost = costs[best_idx]
+
+            if not measure_mode:
+                print(f"Iteración 0 | Mejor coste = {best_cost:.6f}")
+
+            # ------------------------------------------------------------------
+            #  BUCLE PRINCIPAL
+            # ------------------------------------------------------------------
+
+            for t in range(num_it):
+
+                # Actualizar exponente a progresivamente (exploración → explotación)
+                a = A_INI + (A_FIN - A_INI) * (t + 1) / num_it
+
+                # --------------------------------------------------------------
+                #  MOVIMIENTO DE CADA MARIPOSA (#parallel N, λ)
+                # --------------------------------------------------------------
+
+                args_move = []
+                for i in range(num_ind):
+                    # Para búsqueda local: elegir j,k aleatorios con j≠k≠i
+                    candidates = list(range(num_ind))
+                    candidates.remove(i)
+                    j, k = rand.sample(candidates, 2)
+                    seed = np.random.randint(0, 2**31)
+                    args_move.append([X[i], g_star, X[j], X[k],
+                                      fragrances[i], P, seed])
+
+                with Pool(processes=num_proc) as pool:
+                    X_new = pool.starmap(
+                        boa_move_butterfly, args_move,
+                        chunksize=num_ind // num_proc + int(num_ind % num_proc != 0)
+                    )
+
+                # Corregir features sobrantes
+                for i in range(num_ind):
+                    X_new[i] = delete_features(X_new[i])
+
+                # --------------------------------------------------------------
+                #  EVALUACIÓN EN PARALELO
+                # --------------------------------------------------------------
+
+                args_cost = [[X_new[i], ALPHA, BETA,
+                              NUM_SAMPLES_TRAIN, NUM_SAMPLES_TEST,
+                              TRAIN_X, TRAIN_Y, TEST_X, TEST_Y,
+                              NUM_CHAR, MAX_FEATURES] for i in range(num_ind)]
+
+                with Pool(processes=num_proc) as pool:
+                    costs_new = pool.starmap(
+                        cost_func, args_cost,
+                        chunksize=num_ind // num_proc + int(num_ind % num_proc != 0)
+                    )
+
+                # Actualizar posiciones y fragancias (todas las mariposas se mueven)
+                for i in range(num_ind):
+                    X[i]     = X_new[i]
+                    costs[i] = costs_new[i]
+
+                intensity  = 1.0 / (1.0 + costs)
+                fragrances = C * (intensity ** a)
+
+                # --------------------------------------------------------------
+                #  ACTUALIZAR MEJOR SOLUCIÓN GLOBAL g*
+                # --------------------------------------------------------------
+
+                current_best_idx = int(np.argmin(costs))
+                if costs[current_best_idx] < best_cost:
+                    g_star    = X[current_best_idx].copy()
+                    best_cost = costs[current_best_idx]
+
+                curve[t] = best_cost
+
+                if not measure_mode:
+                    print(f"Iteración {t+1} | Mejor coste = {best_cost:.6f}")
+
+            return g_star, curve
     # --------------------------------------------------------------------------
     #  BLOQUE DE EJECUCIÓN DEL ALGORITMO
     #
@@ -727,8 +925,11 @@ if __name__ == "__main__":
 
     try:
 
-         if alg_name == "ABC":
+        if alg_name == "ABC":
             solution, best_solutions_fitness = abc()
+        
+        elif alg_name == "BOA":
+            solution, best_solutions_fitness = boa()
 
     finally:
 
